@@ -26,9 +26,14 @@ LICENSE = "MIT"
 inherit core-image
 
 # Base image features
+# Note: oe-core 6.0 (wrynose) removed the combined "debug-tweaks" feature; use
+# its granular equivalents, which are also valid on older releases.
 IMAGE_FEATURES += " \
     ssh-server-openssh \
-    debug-tweaks \
+    allow-empty-password \
+    allow-root-login \
+    empty-root-password \
+    post-install-logging \
 "
 
 # Core packages for container support

@@ -30,7 +30,10 @@ SRC_URI = " \
     file://rootfs-expand.service \
 "
 
-S = "${WORKDIR}"
+# file:// artifacts unpack to UNPACKDIR (oe-core 6.0/wrynose+) or WORKDIR (older
+# releases). S must not equal WORKDIR on wrynose+, so resolve to the actual
+# unpack dir, falling back to WORKDIR on releases without UNPACKDIR.
+S = "${@d.getVar('UNPACKDIR') or d.getVar('WORKDIR')}"
 
 # Runtime dependencies for partition and filesystem operations
 RDEPENDS:${PN} = " \
@@ -55,11 +58,11 @@ SYSTEMD_AUTO_ENABLE:${PN} = "enable"
 do_install() {
     # Install the expansion script
     install -d ${D}${sbindir}
-    install -m 0755 ${WORKDIR}/rootfs-expand.sh ${D}${sbindir}/rootfs-expand
+    install -m 0755 ${S}/rootfs-expand.sh ${D}${sbindir}/rootfs-expand
 
     # Install systemd service
     install -d ${D}${systemd_system_unitdir}
-    install -m 0644 ${WORKDIR}/rootfs-expand.service ${D}${systemd_system_unitdir}/
+    install -m 0644 ${S}/rootfs-expand.service ${D}${systemd_system_unitdir}/
 
     # Create marker directory
     install -d ${D}${localstatedir}/lib/rootfs-expand

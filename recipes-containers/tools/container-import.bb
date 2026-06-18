@@ -15,6 +15,10 @@ LIC_FILES_CHKSUM = "file://${COMMON_LICENSE_DIR}/MIT;md5=0835ade698e0bcf8506ecda
 
 SRC_URI = "file://container-import.sh"
 
+# file:// artifacts unpack to UNPACKDIR (oe-core 6.0/wrynose+) or WORKDIR (older
+# releases); point S at the actual unpack dir for both.
+S = "${@d.getVar('UNPACKDIR') or d.getVar('WORKDIR')}"
+
 RDEPENDS:${PN} = "podman"
 
 inherit systemd
@@ -25,7 +29,7 @@ SYSTEMD_SERVICE:${PN} = "container-import.service"
 do_install() {
     # Install the import script
     install -d ${D}${libexecdir}
-    install -m 0755 ${WORKDIR}/container-import.sh ${D}${libexecdir}/
+    install -m 0755 ${S}/container-import.sh ${D}${libexecdir}/
 
     # Create directories for import scripts and preloaded images
     install -d ${D}${sysconfdir}/containers/import.d
