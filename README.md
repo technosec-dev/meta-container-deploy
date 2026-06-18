@@ -231,7 +231,7 @@ Pod=myapp.pod
 
 ## Requirements
 
-- Yocto Project: Scarthgap (5.0) or Styhead (5.1)
+- Yocto Project: Scarthgap (5.0 LTS), Styhead (5.1), or Wrynose (6.0 LTS)
 - meta-virtualization layer (for podman, skopeo recipes)
 - systemd as init manager
 - Podman 4.4+ (for Quadlet support)
