@@ -264,10 +264,12 @@ This layer provides **4 methods** to include containers in your Yocto image:
 Add to your `local.conf` to enable systemd (required for Quadlet):
 
 ```bitbake
-DISTRO_FEATURES:append = " systemd usrmerge virtualization"
-DISTRO_FEATURES_BACKFILL_CONSIDERED:append = " sysvinit"
-VIRTUAL-RUNTIME_init_manager = "systemd"
-VIRTUAL-RUNTIME_initscripts = "systemd-compat-units"
+# INIT_MANAGER selects systemd and opts sysvinit out of the backfill in a
+# release-correct way (scarthgap, styhead, and wrynose). It replaces the older
+# manual DISTRO_FEATURES + VIRTUAL-RUNTIME_init_manager incantation, which broke
+# on wrynose (6.0) where DISTRO_FEATURES_BACKFILL_CONSIDERED was renamed.
+INIT_MANAGER = "systemd"
+DISTRO_FEATURES:append = " usrmerge virtualization"
 
 # Required for container networking (iptables/netfilter modules)
 IMAGE_INSTALL:append = " kernel-modules"
