@@ -40,6 +40,7 @@ CONTAINER_ARCH ?= ""
 CONTAINER_VERIFY ?= "0"
 CONTAINER_TLS_VERIFY ?= "1"
 CONTAINER_CERT_DIR ?= ""
+CONTAINER_PODMAN_LOAD ?= ""
 
 # OCI storage locations
 CONTAINER_PRELOAD_DIR = "/var/lib/containers/preloaded"
@@ -236,6 +237,7 @@ python do_pull_container() {
     container_tls_verify = d.getVar('CONTAINER_TLS_VERIFY')
     container_cert_dir = d.getVar('CONTAINER_CERT_DIR')
     container_verify = d.getVar('CONTAINER_VERIFY')
+    container_tarfile = d.getVar('CONTAINER_TAR_FILE')
     workdir = d.getVar('WORKDIR')
     oci_arch = get_oci_arch(d)
 
@@ -281,28 +283,37 @@ python do_pull_container() {
     bb.note(f"Running: {' '.join(skopeo_args)}")
 
     # Run skopeo
-    try:
-        result = subprocess.run(skopeo_args, check=True, capture_output=True, text=True)
-        bb.note(f"Container image {container_name} pulled successfully")
-    except subprocess.CalledProcessError as e:
-        error_msg = e.stderr if e.stderr else str(e)
-        # Provide more specific error messages based on the error
-        if 'unauthorized' in error_msg.lower() or 'authentication required' in error_msg.lower():
-            if container_auth_file:
+    if container_tarfile:
+        tar_args = ['tar', "-xvf", os.path.join(d.getVar("S"), container_tarfile), "-C", oci_dir]
+        try:
+            result = subprocess.run(tar_args, check=True, capture_output=True, text=True)
+            bb.note(f"Container image extractedsuccessfully")
+        except subprocess.CalledProcessError as e:
+            bb.fatal(f"Failed to extract tarball")
+
+    else:
+        try:
+            result = subprocess.run(skopeo_args, check=True, capture_output=True, text=True)
+            bb.note(f"Container image {container_name} pulled successfully")
+        except subprocess.CalledProcessError as e:
+            error_msg = e.stderr if e.stderr else str(e)
+            # Provide more specific error messages based on the error
+            if 'unauthorized' in error_msg.lower() or 'authentication required' in error_msg.lower():
+                if container_auth_file:
+                    bb.fatal(f"Failed to pull container image '{container_name}' ({full_image}): "
+                             f"Authentication failed. Check that the auth file '{container_auth_file}' contains valid credentials.")
+                else:
+                    bb.fatal(f"Failed to pull container image '{container_name}' ({full_image}): "
+                             f"Authentication required. Set 'CONTAINER_AUTH_FILE' to your registry auth config.")
+            elif 'certificate' in error_msg.lower() or 'x509' in error_msg.lower():
                 bb.fatal(f"Failed to pull container image '{container_name}' ({full_image}): "
-                         f"Authentication failed. Check that the auth file '{container_auth_file}' contains valid credentials.")
+                         f"TLS certificate error. Set 'CONTAINER_TLS_VERIFY = \"0\"' for self-signed certs "
+                         f"or 'CONTAINER_CERT_DIR' to specify custom CA certificates.")
+            elif 'manifest unknown' in error_msg.lower() or 'not found' in error_msg.lower():
+                bb.fatal(f"Failed to pull container image '{container_name}' ({full_image}): "
+                         f"Image or tag not found in registry.")
             else:
-                bb.fatal(f"Failed to pull container image '{container_name}' ({full_image}): "
-                         f"Authentication required. Set 'CONTAINER_AUTH_FILE' to your registry auth config.")
-        elif 'certificate' in error_msg.lower() or 'x509' in error_msg.lower():
-            bb.fatal(f"Failed to pull container image '{container_name}' ({full_image}): "
-                     f"TLS certificate error. Set 'CONTAINER_TLS_VERIFY = \"0\"' for self-signed certs "
-                     f"or 'CONTAINER_CERT_DIR' to specify custom CA certificates.")
-        elif 'manifest unknown' in error_msg.lower() or 'not found' in error_msg.lower():
-            bb.fatal(f"Failed to pull container image '{container_name}' ({full_image}): "
-                     f"Image or tag not found in registry.")
-        else:
-            bb.fatal(f"Failed to pull container image '{container_name}' ({full_image}): {error_msg}")
+                bb.fatal(f"Failed to pull container image '{container_name}' ({full_image}): {error_msg}")
 
     # Post-pull verification (default behavior)
     verify_oci_image(oci_dir, container_name, full_image, d)
@@ -428,6 +439,7 @@ do_pull_container[vardeps] = "CONTAINER_IMAGE CONTAINER_NAME CONTAINER_DIGEST CO
 do_install:append() {
     CONTAINER_NAME="${CONTAINER_NAME}"
     CONTAINER_IMAGE="${CONTAINER_IMAGE}"
+    CONTAINER_PODMAN_LOAD="${CONTAINER_PODMAN_LOAD}"
 
     # Install OCI image directory
     install -d ${D}${CONTAINER_PRELOAD_DIR}
@@ -448,19 +460,29 @@ CONTAINER_NAME="${CONTAINER_NAME}"
 CONTAINER_IMAGE="${CONTAINER_IMAGE}"
 IMAGE_DIR="${CONTAINER_PRELOAD_DIR}/${CONTAINER_NAME}"
 MARKER_FILE="${CONTAINER_IMPORT_MARKER_DIR}/${CONTAINER_NAME}"
+FORCE_PODMAN_LOAD="${CONTAINER_PODMAN_LOAD}"
 
 if [ -d "$IMAGE_DIR" ] && [ ! -f "$MARKER_FILE" ]; then
     echo "Importing container image: ${CONTAINER_IMAGE}"
 
     # Import using skopeo (preferred) or podman load
-    if command -v skopeo >/dev/null 2>&1; then
+    if command -v skopeo >/dev/null 2>&1 && test "x${FORCE_PODMAN_LOAD}" = "x"; then
         skopeo copy oci:"$IMAGE_DIR":latest containers-storage:"${CONTAINER_IMAGE}"
+        ret=$?
     else
         # Fallback to podman if skopeo not available at runtime
-        podman load -i "$IMAGE_DIR"
+        #
+        CURDIR=$PWD
+        cd "$IMAGE_DIR"
+        tar cf "/tmp/${CONTAINER_NAME}.tar" *
+        # Note: bug in podman that remove name when loaded an OCI, it works with tar
+        podman load -i "/tmp/${CONTAINER_NAME}.tar"
+        ret=$?
+        rm -f "/tmp/${CONTAINER_NAME}.tar"
+        cd "$CURDIR"
     fi
 
-    if [ $? -eq 0 ]; then
+    if [ $ret -eq 0 ]; then
         touch "$MARKER_FILE"
         echo "Container image ${CONTAINER_NAME} imported successfully"
     else
