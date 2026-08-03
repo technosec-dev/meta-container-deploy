@@ -215,6 +215,29 @@ def get_network_var(d, network_name, var_name, default=''):
     var = d.getVar('NETWORK_%s_%s' % (network_name, var_name))
     return var if var else default
 
+def _repository_tags(inspect_args, container_name):
+    """List a repository's tags, best effort.
+
+    Takes the same skopeo inspect arguments used to verify the image and runs
+    them again without --no-tags. Listing tags is a separate registry lookup
+    rather than part of reading the image, and registries.conf mirrors apply
+    only to reading a single image, so behind a pull-through mirror this call
+    reaches the primary registry while the image itself resolved through the
+    mirror. Where the mirror was supplying the credential, this fails on its
+    own, and it must not take the build with it: the tag list is informational
+    and the image has already been read successfully.
+    """
+    import subprocess
+    import json
+
+    try:
+        args = [arg for arg in inspect_args if arg != '--no-tags']
+        result = subprocess.run(args, check=True, capture_output=True, text=True)
+        return json.loads(result.stdout).get('RepoTags', []) or []
+    except (subprocess.CalledProcessError, json.JSONDecodeError, ValueError) as e:
+        bb.note("Could not list tags for '%s', continuing without them: %s" % (container_name, e))
+        return []
+
 # Global pre-pull verification flag
 CONTAINERS_VERIFY ?= "0"
 
@@ -415,7 +438,16 @@ python do_verify_containers() {
         bb.note(f"Verifying container image exists: '{container_name}' ({full_image})")
 
         # Build skopeo inspect command
-        skopeo_args = ['skopeo', 'inspect', '--override-arch', oci_arch]
+        #
+        # --no-tags because listing the repository's tags is a separate registry
+        # lookup, and registries.conf mirrors are documented to apply only when
+        # reading a single image, never to a lookup or search. Behind a pull-through
+        # mirror the manifest and blobs resolve through it while the tag listing
+        # still goes to the primary registry, so a repository readable through the
+        # mirror fails the whole inspect on the tag call alone. Verifying that an
+        # image exists does not need the tag list; it is fetched separately below,
+        # where failing to get it costs a warning rather than the build.
+        skopeo_args = ['skopeo', 'inspect', '--no-tags', '--override-arch', oci_arch]
 
         # Authentication for private registries
         if auth_file:
@@ -446,7 +478,16 @@ python do_verify_containers() {
                 inspect_data = json.loads(result.stdout)
                 resolved_digest = inspect_data.get('Digest', '')
                 image_name = inspect_data.get('Name', image.split(':')[0])
-                repo_tags = inspect_data.get('RepoTags', [])
+
+                # The tag list, asked for separately and allowed to fail.
+                #
+                # It is informational: the image itself is verified by the
+                # inspect above. Behind a pull-through mirror this call reaches
+                # the primary registry rather than the mirror, so it can fail for
+                # want of a credential the mirror was holding, and that must cost
+                # a note rather than the build.
+                repo_tags = _repository_tags(skopeo_args, container_name)
+
                 created = inspect_data.get('Created', '')
                 labels = inspect_data.get('Labels', {}) or {}
 
@@ -625,7 +666,11 @@ python do_pull_containers() {
             bb.note(f"Resolving digest for '{container_name}' (not pre-verified)")
 
             # Build skopeo inspect command to get digest
-            inspect_args = ['skopeo', 'inspect', '--override-arch', oci_arch]
+            #
+            # --no-tags for the same reason as in do_verify_containers: the tag
+            # listing is a separate lookup that mirrors do not cover, and it
+            # must not decide whether the digest can be resolved.
+            inspect_args = ['skopeo', 'inspect', '--no-tags', '--override-arch', oci_arch]
 
             if auth_file and os.path.exists(auth_file):
                 inspect_args.extend(['--authfile', auth_file])
@@ -644,7 +689,7 @@ python do_pull_containers() {
 
                 resolved_digest = inspect_data.get('Digest', '')
                 image_name = inspect_data.get('Name', image.split(':')[0])
-                repo_tags = inspect_data.get('RepoTags', [])
+                repo_tags = _repository_tags(inspect_args, container_name)
                 created = inspect_data.get('Created', '')
                 labels = inspect_data.get('Labels', {}) or {}
 
