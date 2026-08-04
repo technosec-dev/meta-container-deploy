@@ -92,6 +92,40 @@ Skopeo capabilities used by this layer:
 - **Support multiple image formats** - Convert between Docker v2, OCI, and other formats
 - **Architecture selection** - Pull images for specific CPU architectures (arm64, amd64, etc.)
 - **Authentication** - Support for private registry credentials via Docker config.json
+- **Pre-fetched images** - Deploy from a local OCI archive, contacting no registry at all
+
+#### Building without a registry
+
+`CONTAINER_<name>_OCI_ARCHIVE` names an OCI archive already on disk, and the
+image is read from it instead of being pulled. The archive is produced by
+whatever obtained the image, for example:
+
+```bash
+skopeo copy docker://ghcr.io/org/app:1.2.3 oci-archive:/path/app.oci
+# or: podman save --format oci-archive -o /path/app.oci ghcr.io/org/app:1.2.3
+```
+
+```bash
+CONTAINER_myapp_IMAGE = "ghcr.io/org/app:1.2.3"
+CONTAINER_myapp_OCI_ARCHIVE = "/path/app.oci"
+```
+
+`CONTAINER_<name>_IMAGE` is still required: it names the image the archive
+holds, and is what the deployed system knows the container by.
+
+This makes a build possible where a registry is not reachable: an air-gapped
+machine, a network whose egress does not permit arbitrary registries, or a build
+whose images were fetched ahead of time. It also removes the need for a
+credential at build time, since the image was already obtained. Registry options
+(`AUTH_FILE`, `TLS_VERIFY`, `CERT_DIR`) are ignored for such a container,
+because there is no registry to authenticate to.
+
+An archive that does not exist is an error rather than a silent fall back to the
+registry: falling back would turn an offline build into a confusing network
+failure, or quietly deploy something other than the image that was vetted.
+
+Containers using an archive and containers pulled from a registry can be mixed
+freely in one image.
 
 Build-time vs. runtime usage:
 - **Build time**: `skopeo-native` pulls images and stores them in OCI format in the rootfs
@@ -768,6 +802,7 @@ Enables container configuration via `local.conf` variables (Method 2). Used by `
 | `CONTAINER_<name>_POD` | Pod name to join |
 | `CONTAINER_<name>_VERIFY` | Pre-pull verification ("1" to enable) |
 | `CONTAINER_<name>_AUTH_FILE` | Path to registry auth file (Docker config.json format) |
+| `CONTAINER_<name>_OCI_ARCHIVE` | Path to a pre-fetched OCI archive to deploy instead of pulling from a registry |
 | `CONTAINER_<name>_TLS_VERIFY` | TLS certificate verification ("0" to disable) |
 | `CONTAINER_<name>_CERT_DIR` | Path to directory with custom CA certificates |
 | `CONTAINER_<name>_CGROUPS` | Cgroups mode: enabled, disabled, no-conmon, split |
