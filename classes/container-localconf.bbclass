@@ -215,6 +215,32 @@ def get_network_var(d, network_name, var_name, default=''):
     var = d.getVar('NETWORK_%s_%s' % (network_name, var_name))
     return var if var else default
 
+def _container_image_source(oci_archive, full_image, container_name):
+    """Where skopeo reads this container's image from.
+
+    Returns the source reference and whether it is local.
+
+    A container can name a pre-fetched OCI archive instead of a registry, which
+    is what lets a build deploy containers without reaching a registry at all:
+    an air-gapped machine, a network whose egress does not permit arbitrary
+    registries, or an image obtained ahead of the build for any other reason.
+    skopeo reads an archive directly, so nothing has to be unpacked first, and
+    the rest of the pipeline is unchanged because the destination is the same
+    oci: directory a registry pull would have produced.
+    """
+    import os
+
+    if not oci_archive:
+        return f"docker://{full_image}", False
+
+    if not os.path.isfile(oci_archive):
+        bb.fatal(f"Container '{container_name}' names a pre-fetched image at "
+                 f"'{oci_archive}', which is not a file. "
+                 f"CONTAINER_{container_name}_OCI_ARCHIVE must be an OCI archive "
+                 f"readable by the build.")
+
+    return f"oci-archive:{oci_archive}", True
+
 def _repository_tags(inspect_args, container_name):
     """List a repository's tags, best effort.
 
@@ -242,7 +268,7 @@ def _repository_tags(inspect_args, container_name):
 CONTAINERS_VERIFY ?= "0"
 
 # All container configuration variable suffixes
-CONTAINER_VAR_SUFFIXES = "IMAGE PORTS VOLUMES ENVIRONMENT NETWORK RESTART USER WORKING_DIR DEVICES CAPS_ADD CAPS_DROP PRIVILEGED READ_ONLY MEMORY_LIMIT CPU_LIMIT ENABLED LABELS DEPENDS_ON ENTRYPOINT COMMAND PULL_POLICY DIGEST AUTH_FILE SECURITY_OPTS POD VERIFY CGROUPS SDNOTIFY TIMEZONE STOP_TIMEOUT HEALTH_CMD HEALTH_INTERVAL HEALTH_TIMEOUT HEALTH_RETRIES HEALTH_START_PERIOD LOG_DRIVER LOG_OPT ULIMITS NETWORK_ALIASES"
+CONTAINER_VAR_SUFFIXES = "IMAGE PORTS VOLUMES ENVIRONMENT NETWORK RESTART USER WORKING_DIR DEVICES CAPS_ADD CAPS_DROP PRIVILEGED READ_ONLY MEMORY_LIMIT CPU_LIMIT ENABLED LABELS DEPENDS_ON ENTRYPOINT COMMAND PULL_POLICY DIGEST AUTH_FILE OCI_ARCHIVE SECURITY_OPTS POD VERIFY CGROUPS SDNOTIFY TIMEZONE STOP_TIMEOUT HEALTH_CMD HEALTH_INTERVAL HEALTH_TIMEOUT HEALTH_RETRIES HEALTH_START_PERIOD LOG_DRIVER LOG_OPT ULIMITS NETWORK_ALIASES"
 
 # All pod configuration variable suffixes
 POD_VAR_SUFFIXES = "PORTS NETWORK VOLUMES LABELS DNS DNS_SEARCH HOSTNAME IP MAC ADD_HOST USERNS ENABLED"
@@ -427,6 +453,7 @@ python do_verify_containers() {
         auth_file = get_container_var(d, container_name, 'AUTH_FILE')
         tls_verify = get_container_var(d, container_name, 'TLS_VERIFY')
         cert_dir = get_container_var(d, container_name, 'CERT_DIR')
+        oci_archive = get_container_var(d, container_name, 'OCI_ARCHIVE')
 
         # Determine full image reference
         if digest:
@@ -449,24 +476,31 @@ python do_verify_containers() {
         # where failing to get it costs a warning rather than the build.
         skopeo_args = ['skopeo', 'inspect', '--no-tags', '--override-arch', oci_arch]
 
-        # Authentication for private registries
-        if auth_file:
-            if os.path.exists(auth_file):
-                skopeo_args.extend(['--authfile', auth_file])
-                bb.note(f"Using auth file: {auth_file}")
-            else:
-                bb.warn(f"Auth file specified but not found: {auth_file}")
+        source_ref, from_archive = _container_image_source(oci_archive, full_image, container_name)
 
-        # TLS options for private registries with self-signed certificates
-        if tls_verify == '0':
-            skopeo_args.append('--tls-verify=false')
-            bb.warn(f"TLS verification disabled for '{container_name}' - use only for testing")
+        # Registry options, which a pre-fetched archive has no use for: there is
+        # no host to authenticate to and no certificate to check.
+        if not from_archive:
+            # Authentication for private registries
+            if auth_file:
+                if os.path.exists(auth_file):
+                    skopeo_args.extend(['--authfile', auth_file])
+                    bb.note(f"Using auth file: {auth_file}")
+                else:
+                    bb.warn(f"Auth file specified but not found: {auth_file}")
 
-        if cert_dir and os.path.isdir(cert_dir):
-            skopeo_args.extend(['--cert-dir', cert_dir])
-            bb.note(f"Using certificate directory: {cert_dir}")
+            # TLS options for private registries with self-signed certificates
+            if tls_verify == '0':
+                skopeo_args.append('--tls-verify=false')
+                bb.warn(f"TLS verification disabled for '{container_name}' - use only for testing")
 
-        skopeo_args.append(f"docker://{full_image}")
+            if cert_dir and os.path.isdir(cert_dir):
+                skopeo_args.extend(['--cert-dir', cert_dir])
+                bb.note(f"Using certificate directory: {cert_dir}")
+        else:
+            bb.note(f"Verifying '{container_name}' from a pre-fetched image: {oci_archive}")
+
+        skopeo_args.append(source_ref)
 
         bb.note(f"Running: {' '.join(skopeo_args)}")
 
@@ -486,7 +520,9 @@ python do_verify_containers() {
                 # the primary registry rather than the mirror, so it can fail for
                 # want of a credential the mirror was holding, and that must cost
                 # a note rather than the build.
-                repo_tags = _repository_tags(skopeo_args, container_name)
+                # An archive is not a repository, so there is no tag list to ask
+                # for and asking would only produce a note about not getting one.
+                repo_tags = [] if from_archive else _repository_tags(skopeo_args, container_name)
 
                 created = inspect_data.get('Created', '')
                 labels = inspect_data.get('Labels', {}) or {}
@@ -592,6 +628,7 @@ python do_pull_containers() {
         auth_file = get_container_var(d, container_name, 'AUTH_FILE')
         tls_verify = get_container_var(d, container_name, 'TLS_VERIFY')
         cert_dir = get_container_var(d, container_name, 'CERT_DIR')
+        oci_archive = get_container_var(d, container_name, 'OCI_ARCHIVE')
 
         # Determine full image reference
         if digest:
@@ -610,25 +647,33 @@ python do_pull_containers() {
         # Build skopeo command
         skopeo_args = ['skopeo', 'copy', '--override-arch', oci_arch]
 
-        # Authentication for private registries
-        if auth_file:
-            if os.path.exists(auth_file):
-                skopeo_args.extend(['--authfile', auth_file])
-                bb.note(f"Using auth file: {auth_file}")
-            else:
-                bb.warn(f"Auth file specified but not found: {auth_file}")
+        source_ref, from_archive = _container_image_source(oci_archive, full_image, container_name)
 
-        # TLS options for private registries with self-signed certificates
-        if tls_verify == '0':
-            skopeo_args.append('--src-tls-verify=false')
-            bb.warn(f"TLS verification disabled for '{container_name}' - use only for testing")
+        # Registry options, which a pre-fetched archive has no use for.
+        if not from_archive:
+            # Authentication for private registries
+            if auth_file:
+                if os.path.exists(auth_file):
+                    skopeo_args.extend(['--authfile', auth_file])
+                    bb.note(f"Using auth file: {auth_file}")
+                else:
+                    bb.warn(f"Auth file specified but not found: {auth_file}")
 
-        if cert_dir and os.path.isdir(cert_dir):
-            skopeo_args.extend(['--src-cert-dir', cert_dir])
-            bb.note(f"Using certificate directory: {cert_dir}")
+            # TLS options for private registries with self-signed certificates
+            if tls_verify == '0':
+                skopeo_args.append('--src-tls-verify=false')
+                bb.warn(f"TLS verification disabled for '{container_name}' - use only for testing")
 
-        # Add source and destination
-        skopeo_args.append(f"docker://{full_image}")
+            if cert_dir and os.path.isdir(cert_dir):
+                skopeo_args.extend(['--src-cert-dir', cert_dir])
+                bb.note(f"Using certificate directory: {cert_dir}")
+        else:
+            bb.note(f"Deploying '{container_name}' from a pre-fetched image, "
+                    f"no registry is contacted: {oci_archive}")
+
+        # Add source and destination. The destination is the same either way, so
+        # everything downstream of this copy is unchanged.
+        skopeo_args.append(source_ref)
         skopeo_args.append(f"oci:{oci_dir}:latest")
 
         bb.note(f"Running: {' '.join(skopeo_args)}")
@@ -672,16 +717,20 @@ python do_pull_containers() {
             # must not decide whether the digest can be resolved.
             inspect_args = ['skopeo', 'inspect', '--no-tags', '--override-arch', oci_arch]
 
-            if auth_file and os.path.exists(auth_file):
-                inspect_args.extend(['--authfile', auth_file])
+            inspect_source, inspect_from_archive = _container_image_source(
+                oci_archive, full_image, container_name)
 
-            if tls_verify == '0':
-                inspect_args.append('--tls-verify=false')
+            if not inspect_from_archive:
+                if auth_file and os.path.exists(auth_file):
+                    inspect_args.extend(['--authfile', auth_file])
 
-            if cert_dir and os.path.isdir(cert_dir):
-                inspect_args.extend(['--cert-dir', cert_dir])
+                if tls_verify == '0':
+                    inspect_args.append('--tls-verify=false')
 
-            inspect_args.append(f"docker://{full_image}")
+                if cert_dir and os.path.isdir(cert_dir):
+                    inspect_args.extend(['--cert-dir', cert_dir])
+
+            inspect_args.append(inspect_source)
 
             try:
                 inspect_result = subprocess.run(inspect_args, capture_output=True, text=True, check=True)
@@ -689,7 +738,7 @@ python do_pull_containers() {
 
                 resolved_digest = inspect_data.get('Digest', '')
                 image_name = inspect_data.get('Name', image.split(':')[0])
-                repo_tags = _repository_tags(inspect_args, container_name)
+                repo_tags = [] if inspect_from_archive else _repository_tags(inspect_args, container_name)
                 created = inspect_data.get('Created', '')
                 labels = inspect_data.get('Labels', {}) or {}
 
