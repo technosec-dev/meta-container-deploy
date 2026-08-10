@@ -185,6 +185,11 @@ python do_generate_quadlet() {
     if command:
         lines.append("Exec=" + command)
 
+    # EnvironmentFile variables
+    environmentfile = d.getVar('CONTAINER_ENVIRONMENT_FILE')
+    if environmentfile:
+        lines.append("EnvironmentFile=" + environmentfile)
+
     # Environment variables
     environment = d.getVar('CONTAINER_ENVIRONMENT')
     if environment:
