@@ -264,6 +264,56 @@ def _repository_tags(inspect_args, container_name):
         bb.note("Could not list tags for '%s', continuing without them: %s" % (container_name, e))
         return []
 
+def _resolve_moving_tag_digest(d, container_name, oci_arch):
+    """Resolve a registry image reference to the digest it currently points at.
+
+    A container pinned to a DIGEST, or served from a pre-fetched OCI archive, is
+    already immutable and is left alone. A plain tag is not: the registry can
+    repoint it at a new image while the reference string stays the same. The pull
+    task is keyed on that string, so without this a moving tag is fetched once and
+    then served from the shared build cache on every later build, baking a stale
+    image. Resolving the tag to its current digest and feeding that digest into
+    the pull task's signature makes the task rerun exactly when the tag has moved.
+
+    Returns the digest, or '' when it cannot be resolved (registry unreachable,
+    tag removed) or does not apply (digest already pinned, local archive). On a
+    resolution failure the caller keeps the tag-based behaviour and warns.
+    """
+    import os
+    import subprocess
+
+    if get_container_var(d, container_name, 'DIGEST'):
+        return ''
+    if get_container_var(d, container_name, 'OCI_ARCHIVE'):
+        return ''
+
+    image = get_container_var(d, container_name, 'IMAGE')
+    auth_file = get_container_var(d, container_name, 'AUTH_FILE')
+    tls_verify = get_container_var(d, container_name, 'TLS_VERIFY')
+    cert_dir = get_container_var(d, container_name, 'CERT_DIR')
+
+    args = ['skopeo', 'inspect', '--no-tags', '--format', '{{.Digest}}',
+            '--override-arch', oci_arch]
+    if auth_file and os.path.exists(auth_file):
+        args.extend(['--authfile', auth_file])
+    if tls_verify == '0':
+        args.append('--tls-verify=false')
+    if cert_dir and os.path.isdir(cert_dir):
+        args.extend(['--cert-dir', cert_dir])
+    args.append(f"docker://{image}")
+
+    try:
+        result = subprocess.run(args, check=True, capture_output=True, text=True)
+        return result.stdout.strip()
+    except (subprocess.CalledProcessError, OSError) as e:
+        err = getattr(e, 'stderr', '') or str(e)
+        bb.warn("Could not resolve the current digest for container '%s' (%s): %s. "
+                "It will be pulled from its tag, but a tag that moves while its "
+                "reference stays the same may be served from cache; pin "
+                "CONTAINER_%s_DIGEST for a reproducible image."
+                % (container_name, image, err, container_name.replace('-', '_')))
+        return ''
+
 # Global pre-pull verification flag
 CONTAINERS_VERIFY ?= "0"
 
@@ -275,6 +325,12 @@ POD_VAR_SUFFIXES = "PORTS NETWORK VOLUMES LABELS DNS DNS_SEARCH HOSTNAME IP MAC 
 
 # All network configuration variable suffixes
 NETWORK_VAR_SUFFIXES = "DRIVER SUBNET GATEWAY IP_RANGE IPV6 INTERNAL DNS LABELS OPTIONS ENABLED"
+
+# Re-parse this recipe on every build. The anonymous python below resolves each
+# moving tag to the digest it currently points at, and a cached parse would
+# freeze that resolution, so a tag that moved between builds would go unnoticed.
+# A digest-only configuration still re-parses but does no network.
+BB_DONT_CACHE = "1"
 
 # Validate container and pod configuration at parse time and set up vardeps
 python __anonymous() {
@@ -288,6 +344,9 @@ python __anonymous() {
     # Build list of all container variables for vardeps
     var_suffixes = (d.getVar('CONTAINER_VAR_SUFFIXES') or '').split()
     all_vars = ['CONTAINERS', 'PODS']
+    # Resolved-digest variables for moving tags, folded into the pull task's
+    # signature only (the quadlet/pod/network tasks do not fetch anything).
+    resolved_digest_vars = []
 
     for container_name in containers:
         safe_name = container_name.replace('-', '_').replace('.', '_')
@@ -298,6 +357,17 @@ python __anonymous() {
         if not image:
             bb.fatal("CONTAINER_%s_IMAGE must be set for container '%s'" %
                      (container_name.replace('-', '_'), container_name))
+
+        # A moving tag is resolved to its current digest so the pull tracks the
+        # registry rather than the reference string. A pinned digest or a local
+        # archive resolves to nothing and keeps its cached, reproducible pull.
+        resolved_digest = _resolve_moving_tag_digest(d, container_name, get_oci_arch(d))
+        if resolved_digest:
+            resolved_var = f'CONTAINER_{safe_name}_RESOLVED_DIGEST'
+            d.setVar(resolved_var, resolved_digest)
+            resolved_digest_vars.append(resolved_var)
+            bb.note("Container '%s' tag %s resolved to %s" %
+                    (container_name, image, resolved_digest))
 
         # Validate restart policy if specified
         restart = get_container_var(d, container_name, 'RESTART', 'always')
@@ -359,7 +429,11 @@ python __anonymous() {
     d.appendVarFlag('do_generate_pods', 'vardeps', ' ' + vardeps_str)
     d.appendVarFlag('do_generate_networks', 'vardeps', ' ' + vardeps_str)
     d.appendVarFlag('do_generate_import_scripts', 'vardeps', ' ' + vardeps_str)
-    d.appendVarFlag('do_pull_containers', 'vardeps', ' ' + vardeps_str)
+    # The pull task additionally depends on the resolved digests: when a moving
+    # tag advances, its digest value changes, the task signature changes, and the
+    # image is re-pulled instead of restored stale from the shared build cache.
+    d.appendVarFlag('do_pull_containers', 'vardeps',
+                    ' ' + vardeps_str + ' ' + ' '.join(resolved_digest_vars))
 
     if containers:
         bb.note("Configured %d containers from local.conf: %s" % (len(containers), ', '.join(containers)))
