@@ -298,7 +298,10 @@ def _resolve_moving_tag_digest(d, container_name, oci_arch):
     tls_verify = get_container_var(d, container_name, 'TLS_VERIFY')
     cert_dir = get_container_var(d, container_name, 'CERT_DIR')
 
-    args = ['skopeo', 'inspect', '--no-tags', '--format', '{{.Digest}}',
+    # No --no-tags: it only lands in skopeo 1.5+, and the host skopeo can be
+    # older (Ubuntu 22.04 ships 1.4.1). --format '{{.Digest}}' returns the
+    # manifest digest on every version, which is all this needs.
+    args = ['skopeo', 'inspect', '--format', '{{.Digest}}',
             '--override-arch', oci_arch]
     if auth_file and os.path.exists(auth_file):
         args.extend(['--authfile', auth_file])
