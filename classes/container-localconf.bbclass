@@ -265,19 +265,25 @@ def _repository_tags(inspect_args, container_name):
         return []
 
 def _resolve_moving_tag_digest(d, container_name, oci_arch):
-    """Resolve a registry image reference to the digest it currently points at.
+    """Return a per-build freshness key for a moving-tag container.
 
     A container pinned to a DIGEST, or served from a pre-fetched OCI archive, is
-    already immutable and is left alone. A plain tag is not: the registry can
-    repoint it at a new image while the reference string stays the same. The pull
-    task is keyed on that string, so without this a moving tag is fetched once and
-    then served from the shared build cache on every later build, baking a stale
-    image. Resolving the tag to its current digest and feeding that digest into
-    the pull task's signature makes the task rerun exactly when the tag has moved.
+    already immutable and is left alone (returns ''). A plain tag is mutable: the
+    registry can repoint it while the reference string stays the same, and the
+    pull task is keyed on that string, so without a changing signature a moving
+    tag is fetched once and then served stale from the shared build cache.
 
-    Returns the digest, or '' when it cannot be resolved (registry unreachable,
-    tag removed) or does not apply (digest already pinned, local archive). On a
-    resolution failure the caller keeps the tag-based behaviour and warns.
+    The caller folds the returned value into the pull task's signature, so when it
+    changes the task reruns and the image is re-pulled:
+      - When skopeo is available, it is the tag's current digest, so the pull
+        reruns exactly when the tag has moved (efficient, change-only).
+      - When skopeo is not available (it is skopeo-native, present during tasks
+        but not during this parse), it is the build timestamp, so a moving tag is
+        pulled fresh on every build. That is the moving-tag policy: always pull.
+
+    Pin CONTAINER_<name>_DIGEST for a reproducible image, or install a host skopeo
+    in the build environment to turn the always-pull fallback into change-only
+    pulls.
     """
     import os
     import subprocess
@@ -304,15 +310,26 @@ def _resolve_moving_tag_digest(d, container_name, oci_arch):
 
     try:
         result = subprocess.run(args, check=True, capture_output=True, text=True)
-        return result.stdout.strip()
+        digest = result.stdout.strip()
+        if digest:
+            return digest
     except (subprocess.CalledProcessError, OSError) as e:
         err = getattr(e, 'stderr', '') or str(e)
-        bb.warn("Could not resolve the current digest for container '%s' (%s): %s. "
-                "It will be pulled from its tag, but a tag that moves while its "
-                "reference stays the same may be served from cache; pin "
-                "CONTAINER_%s_DIGEST for a reproducible image."
+        bb.note("Could not resolve the current digest for container '%s' (%s): %s. "
+                "It will be pulled fresh on every build (the moving-tag policy). "
+                "Install skopeo in the build environment for change-only pulls, or "
+                "pin CONTAINER_%s_DIGEST for a reproducible image."
                 % (container_name, image, err, container_name.replace('-', '_')))
-        return ''
+
+    # No digest resolved (skopeo absent, which is the norm at parse time, or the
+    # lookup failed). Fall back to the build timestamp so the pull task's
+    # signature changes every build and a moving tag is pulled fresh rather than
+    # served stale from the shared cache. This is the moving-tag policy: always
+    # pull. DATETIME is fixed within a build and changes between builds (the
+    # recipe re-parses via BB_DONT_CACHE). The value is only a signature input,
+    # never used as the image reference, so a timestamp in place of a digest is
+    # harmless.
+    return d.getVar('DATETIME') or ''
 
 # Global pre-pull verification flag
 CONTAINERS_VERIFY ?= "0"
