@@ -264,74 +264,29 @@ def _repository_tags(inspect_args, container_name):
         bb.note("Could not list tags for '%s', continuing without them: %s" % (container_name, e))
         return []
 
-def _resolve_moving_tag_digest(d, container_name, oci_arch):
-    """Return a per-build freshness key for a moving-tag container.
+def _is_moving_tag(d, container_name):
+    """Whether a container's image can change under a fixed reference.
 
     A container pinned to a DIGEST, or served from a pre-fetched OCI archive, is
-    already immutable and is left alone (returns ''). A plain tag is mutable: the
-    registry can repoint it while the reference string stays the same, and the
-    pull task is keyed on that string, so without a changing signature a moving
-    tag is fetched once and then served stale from the shared build cache.
+    immutable: the reference always names the same bytes, so its pull is cached
+    and reproducible. Anything else is a plain tag the registry can repoint while
+    the reference string stays the same, so it must be pulled fresh on every build
+    (the caller marks the pull task nostamp).
 
-    The caller folds the returned value into the pull task's signature, so when it
-    changes the task reruns and the image is re-pulled:
-      - When skopeo is available, it is the tag's current digest, so the pull
-        reruns exactly when the tag has moved (efficient, change-only).
-      - When skopeo is not available or cannot reach the registry, it returns
-        None. The caller then marks the pull task nostamp, so a moving tag is
-        pulled fresh on every build (the moving-tag policy: always pull) without
-        putting a per-build value in the task's signature, which BitBake would
-        reject as non-deterministic metadata.
-
-    Pin CONTAINER_<name>_DIGEST for a reproducible image, or let a host skopeo
-    reach the registry at parse time to turn the always-pull fallback into
-    change-only pulls.
+    The decision reads only local.conf variables, never a registry lookup, so it
+    is identical on every reparse of the recipe. Resolving the tag's current
+    digest with skopeo at parse time (the previous approach) instead varied with
+    skopeo's availability and the registry's state between reparses: the resolved
+    digest appeared in the pull task's signature on one reparse and not the next,
+    changing its basehash and failing the build with "the metadata is not
+    deterministic". The current digest is still resolved at task time, for the
+    SBOM, where a network lookup is expected and harmless.
     """
-    import os
-    import subprocess
-
     if get_container_var(d, container_name, 'DIGEST'):
-        return ''
+        return False
     if get_container_var(d, container_name, 'OCI_ARCHIVE'):
-        return ''
-
-    image = get_container_var(d, container_name, 'IMAGE')
-    auth_file = get_container_var(d, container_name, 'AUTH_FILE')
-    tls_verify = get_container_var(d, container_name, 'TLS_VERIFY')
-    cert_dir = get_container_var(d, container_name, 'CERT_DIR')
-
-    # No --no-tags: it only lands in skopeo 1.5+, and the host skopeo can be
-    # older (Ubuntu 22.04 ships 1.4.1). --format '{{.Digest}}' returns the
-    # manifest digest on every version, which is all this needs.
-    args = ['skopeo', 'inspect', '--format', '{{.Digest}}',
-            '--override-arch', oci_arch]
-    if auth_file and os.path.exists(auth_file):
-        args.extend(['--authfile', auth_file])
-    if tls_verify == '0':
-        args.append('--tls-verify=false')
-    if cert_dir and os.path.isdir(cert_dir):
-        args.extend(['--cert-dir', cert_dir])
-    args.append(f"docker://{image}")
-
-    try:
-        result = subprocess.run(args, check=True, capture_output=True, text=True)
-        digest = result.stdout.strip()
-        if digest:
-            return digest
-    except (subprocess.CalledProcessError, OSError) as e:
-        err = getattr(e, 'stderr', '') or str(e)
-        bb.note("Could not resolve the current digest for container '%s' (%s): %s. "
-                "It will be pulled fresh on every build (the moving-tag policy). "
-                "Install skopeo in the build environment for change-only pulls, or "
-                "pin CONTAINER_%s_DIGEST for a reproducible image."
-                % (container_name, image, err, container_name.replace('-', '_')))
-
-    # No digest resolved (skopeo absent, which is the norm at parse time, or the
-    # lookup failed). Signal the caller to mark the pull task nostamp so the
-    # moving tag is pulled fresh on every build. Returning a per-build value here
-    # (a timestamp) would instead land in the task's basehash and change on every
-    # reparse, which BitBake rejects as non-deterministic metadata.
-    return None
+        return False
+    return True
 
 # Global pre-pull verification flag
 CONTAINERS_VERIFY ?= "0"
@@ -363,12 +318,10 @@ python __anonymous() {
     # Build list of all container variables for vardeps
     var_suffixes = (d.getVar('CONTAINER_VAR_SUFFIXES') or '').split()
     all_vars = ['CONTAINERS', 'PODS']
-    # Resolved-digest variables for moving tags, folded into the pull task's
-    # signature only (the quadlet/pod/network tasks do not fetch anything).
-    resolved_digest_vars = []
-    # Set when a moving tag could not be resolved to a digest at parse: the pull
-    # task is then made nostamp (always run) rather than keyed on a changing
-    # signature value.
+    # Set when any container uses a moving tag: its pull task is made nostamp
+    # (always run) so the tag is re-pulled every build. Decided from local.conf
+    # alone, never a parse-time registry lookup, so the task's basehash is the
+    # same on every reparse.
     needs_always_pull = False
 
     for container_name in containers:
@@ -381,20 +334,12 @@ python __anonymous() {
             bb.fatal("CONTAINER_%s_IMAGE must be set for container '%s'" %
                      (container_name.replace('-', '_'), container_name))
 
-        # A moving tag is resolved to its current digest so the pull tracks the
-        # registry rather than the reference string. A pinned digest or a local
-        # archive resolves to nothing and keeps its cached, reproducible pull.
-        resolved_digest = _resolve_moving_tag_digest(d, container_name, get_oci_arch(d))
-        if resolved_digest is None:
-            # Could not resolve this moving tag's current digest at parse; it
-            # must be pulled fresh on every build (nostamp is set below).
+        # A plain tag is mutable: the registry can repoint it under the same
+        # reference string, so the image is pulled fresh on every build (nostamp,
+        # set below). A digest-pinned or archive-backed container is immutable and
+        # keeps its cached, reproducible pull.
+        if _is_moving_tag(d, container_name):
             needs_always_pull = True
-        elif resolved_digest:
-            resolved_var = f'CONTAINER_{safe_name}_RESOLVED_DIGEST'
-            d.setVar(resolved_var, resolved_digest)
-            resolved_digest_vars.append(resolved_var)
-            bb.note("Container '%s' tag %s resolved to %s" %
-                    (container_name, image, resolved_digest))
 
         # Validate restart policy if specified
         restart = get_container_var(d, container_name, 'RESTART', 'always')
@@ -456,18 +401,13 @@ python __anonymous() {
     d.appendVarFlag('do_generate_pods', 'vardeps', ' ' + vardeps_str)
     d.appendVarFlag('do_generate_networks', 'vardeps', ' ' + vardeps_str)
     d.appendVarFlag('do_generate_import_scripts', 'vardeps', ' ' + vardeps_str)
-    # The pull task additionally depends on the resolved digests: when a moving
-    # tag advances, its digest value changes, the task signature changes, and the
-    # image is re-pulled instead of restored stale from the shared build cache.
-    d.appendVarFlag('do_pull_containers', 'vardeps',
-                    ' ' + vardeps_str + ' ' + ' '.join(resolved_digest_vars))
+    d.appendVarFlag('do_pull_containers', 'vardeps', ' ' + vardeps_str)
     if needs_always_pull:
-        # At least one moving tag could not be resolved to a digest at parse (no
-        # host skopeo, or the registry was unreachable, as on a cloud build whose
-        # registry auth is not available at parse). Pull fresh on every build by
-        # making the task always run. nostamp keeps the basehash deterministic,
-        # unlike a per-build value folded into vardeps, which BitBake rejects as
-        # non-deterministic metadata.
+        # At least one container uses a moving tag (not pinned by digest, not a
+        # pre-fetched archive). Pull fresh on every build by making the task
+        # always run. nostamp is a static flag, so unlike a resolved digest folded
+        # into the signature it keeps the basehash deterministic across reparses;
+        # the tag's current digest is resolved at task time for the SBOM.
         d.setVarFlag('do_pull_containers', 'nostamp', '1')
 
     if containers:
