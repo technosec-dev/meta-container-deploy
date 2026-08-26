@@ -2,12 +2,13 @@
 """Logic tests for container-localconf.bbclass.
 
 The bbclass cannot be imported (it is BitBake metadata, not a Python module), so
-these tests extract the pure-Python helper `_resolve_moving_tag_digest` and
-exercise it with stubs. The property that matters most is DETERMINISM: when a
-moving tag's digest cannot be resolved at parse time, the resolver must return
-None (so the caller can mark the pull task nostamp) and must never read a
-per-parse value like DATETIME, which would make the pull task's basehash change
-on reparse and fail the build with "the metadata is not deterministic".
+these tests extract the pure-Python helper `_is_moving_tag` and exercise it with
+stubs. The property that matters most is DETERMINISM: the moving-vs-immutable
+decision must come from local.conf variables alone and must never depend on a
+registry lookup, a subprocess, or any per-parse value. A parse-time skopeo call
+(the previous approach) made the pull task's basehash change between reparses
+whenever skopeo's availability or the registry's state changed, failing the build
+with "the metadata is not deterministic".
 
 Run: python3 tests/test_container_localconf.py
 """
@@ -20,11 +21,11 @@ import types
 BBCLASS = os.path.join(os.path.dirname(__file__), "..", "classes", "container-localconf.bbclass")
 
 
-def load_resolver():
+def load_func(name):
     src = open(BBCLASS).read()
-    m = re.search(r"^def _resolve_moving_tag_digest\(.*?(?=^\S)", src, re.S | re.M)
+    m = re.search(r"^def %s\(.*?(?=^\S)" % re.escape(name), src, re.S | re.M)
     if not m:
-        raise AssertionError("_resolve_moving_tag_digest not found in bbclass")
+        raise AssertionError("%s not found in bbclass" % name)
     ns = {"bb": types.SimpleNamespace(note=lambda *a, **k: None)}
     exec(m.group(0), ns)
     return ns
@@ -37,60 +38,58 @@ def make_gcv(vars_):
 
 
 class StrictD:
-    """Fails if the resolver reads any per-parse value: that would be non-deterministic."""
+    """Fails if the function reads any per-parse value or datastore var directly."""
 
     def getVar(self, k):
-        raise AssertionError("resolver read d.getVar(%r): non-deterministic" % k)
+        raise AssertionError("read d.getVar(%r) directly: non-deterministic" % k)
 
 
 def main():
-    ns = load_resolver()
-    resolve = ns["_resolve_moving_tag_digest"]
-    orig_run = subprocess.run
+    ns = load_func("_is_moving_tag")
+    is_moving = ns["_is_moving_tag"]
     checks = []
 
     def check(name, cond):
         checks.append(cond)
         print(("PASS" if cond else "FAIL"), "-", name)
 
-    # Immutable references carry no freshness key.
+    # A digest-pinned or archive-backed reference is immutable: cached, reproducible
+    # pull, so NOT a moving tag.
     ns["get_container_var"] = make_gcv({"DIGEST": "sha256:abc"})
-    check("pinned digest returns ''", resolve(StrictD(), "c", "amd64") == "")
+    check("pinned digest is not moving", is_moving(StrictD(), "c") is False)
     ns["get_container_var"] = make_gcv({"OCI_ARCHIVE": "/img.tar"})
-    check("oci archive returns ''", resolve(StrictD(), "c", "amd64") == "")
+    check("oci archive is not moving", is_moving(StrictD(), "c") is False)
+    # Digest wins even if an archive is also somehow set.
+    ns["get_container_var"] = make_gcv({"DIGEST": "sha256:abc", "IMAGE": "ghcr.io/x/y:devel"})
+    check("pinned digest with an image tag is still not moving", is_moving(StrictD(), "c") is False)
 
-    # skopeo resolves -> the digest (change-only pulls).
+    # A plain tag is mutable: always-pull (the caller sets nostamp).
     ns["get_container_var"] = make_gcv({"IMAGE": "ghcr.io/x/y:devel"})
-    subprocess.run = lambda args, **k: types.SimpleNamespace(stdout="sha256:deadbeef\n")
-    try:
-        check("skopeo success returns the digest", resolve(StrictD(), "c", "amd64") == "sha256:deadbeef")
-    finally:
-        subprocess.run = orig_run
-
-    # skopeo missing -> None, deterministic across reparses (the fix).
-    ns["get_container_var"] = make_gcv({"IMAGE": "ghcr.io/x/y:devel"})
-
-    def _oserr(args, **k):
-        raise OSError("skopeo: not found")
-
-    subprocess.run = _oserr
-    try:
-        r1 = resolve(StrictD(), "c", "amd64")
-        r2 = resolve(StrictD(), "c", "amd64")
-    finally:
-        subprocess.run = orig_run
-    check("skopeo missing returns None (not a timestamp)", r1 is None)
-    check("unresolved is deterministic across reparses", r1 is None and r2 is None)
-
-    # Private image with no parse-time auth (the cloud case) -> None, not a failure.
+    check("plain tag is moving", is_moving(StrictD(), "c") is True)
     ns["get_container_var"] = make_gcv({"IMAGE": "ghcr.io/mistral-dev/x:devel"})
+    check("private plain tag is moving", is_moving(StrictD(), "c") is True)
 
-    def _cpe(args, **k):
-        raise subprocess.CalledProcessError(1, args, stderr="unauthorized")
+    # DETERMINISM: the decision is a pure function of local.conf, identical across
+    # reparses. This is the regression the fix closes: it must not vary with a
+    # network lookup, and it must never invoke a subprocess at parse time.
+    ns["get_container_var"] = make_gcv({"IMAGE": "ghcr.io/x/y:devel"})
+    r1 = is_moving(StrictD(), "c")
+    r2 = is_moving(StrictD(), "c")
+    check("moving decision is stable across reparses", r1 is True and r2 is True)
 
-    subprocess.run = _cpe
+    orig_run = subprocess.run
+
+    def _boom(*a, **k):
+        raise AssertionError("_is_moving_tag ran a subprocess at parse: non-deterministic")
+
+    subprocess.run = _boom
     try:
-        check("skopeo auth error returns None", resolve(StrictD(), "c", "amd64") is None)
+        ns["get_container_var"] = make_gcv({"IMAGE": "ghcr.io/x/y:devel"})
+        moving = is_moving(StrictD(), "c")
+        check("no subprocess at parse time (moving tag)", moving is True)
+        ns["get_container_var"] = make_gcv({"DIGEST": "sha256:abc"})
+        pinned = is_moving(StrictD(), "c")
+        check("no subprocess at parse time (pinned)", pinned is False)
     finally:
         subprocess.run = orig_run
 
