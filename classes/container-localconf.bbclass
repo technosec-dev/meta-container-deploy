@@ -277,13 +277,15 @@ def _resolve_moving_tag_digest(d, container_name, oci_arch):
     changes the task reruns and the image is re-pulled:
       - When skopeo is available, it is the tag's current digest, so the pull
         reruns exactly when the tag has moved (efficient, change-only).
-      - When skopeo is not available (it is skopeo-native, present during tasks
-        but not during this parse), it is the build timestamp, so a moving tag is
-        pulled fresh on every build. That is the moving-tag policy: always pull.
+      - When skopeo is not available or cannot reach the registry, it returns
+        None. The caller then marks the pull task nostamp, so a moving tag is
+        pulled fresh on every build (the moving-tag policy: always pull) without
+        putting a per-build value in the task's signature, which BitBake would
+        reject as non-deterministic metadata.
 
-    Pin CONTAINER_<name>_DIGEST for a reproducible image, or install a host skopeo
-    in the build environment to turn the always-pull fallback into change-only
-    pulls.
+    Pin CONTAINER_<name>_DIGEST for a reproducible image, or let a host skopeo
+    reach the registry at parse time to turn the always-pull fallback into
+    change-only pulls.
     """
     import os
     import subprocess
@@ -325,14 +327,11 @@ def _resolve_moving_tag_digest(d, container_name, oci_arch):
                 % (container_name, image, err, container_name.replace('-', '_')))
 
     # No digest resolved (skopeo absent, which is the norm at parse time, or the
-    # lookup failed). Fall back to the build timestamp so the pull task's
-    # signature changes every build and a moving tag is pulled fresh rather than
-    # served stale from the shared cache. This is the moving-tag policy: always
-    # pull. DATETIME is fixed within a build and changes between builds (the
-    # recipe re-parses via BB_DONT_CACHE). The value is only a signature input,
-    # never used as the image reference, so a timestamp in place of a digest is
-    # harmless.
-    return d.getVar('DATETIME') or ''
+    # lookup failed). Signal the caller to mark the pull task nostamp so the
+    # moving tag is pulled fresh on every build. Returning a per-build value here
+    # (a timestamp) would instead land in the task's basehash and change on every
+    # reparse, which BitBake rejects as non-deterministic metadata.
+    return None
 
 # Global pre-pull verification flag
 CONTAINERS_VERIFY ?= "0"
@@ -367,6 +366,10 @@ python __anonymous() {
     # Resolved-digest variables for moving tags, folded into the pull task's
     # signature only (the quadlet/pod/network tasks do not fetch anything).
     resolved_digest_vars = []
+    # Set when a moving tag could not be resolved to a digest at parse: the pull
+    # task is then made nostamp (always run) rather than keyed on a changing
+    # signature value.
+    needs_always_pull = False
 
     for container_name in containers:
         safe_name = container_name.replace('-', '_').replace('.', '_')
@@ -382,7 +385,11 @@ python __anonymous() {
         # registry rather than the reference string. A pinned digest or a local
         # archive resolves to nothing and keeps its cached, reproducible pull.
         resolved_digest = _resolve_moving_tag_digest(d, container_name, get_oci_arch(d))
-        if resolved_digest:
+        if resolved_digest is None:
+            # Could not resolve this moving tag's current digest at parse; it
+            # must be pulled fresh on every build (nostamp is set below).
+            needs_always_pull = True
+        elif resolved_digest:
             resolved_var = f'CONTAINER_{safe_name}_RESOLVED_DIGEST'
             d.setVar(resolved_var, resolved_digest)
             resolved_digest_vars.append(resolved_var)
@@ -454,6 +461,14 @@ python __anonymous() {
     # image is re-pulled instead of restored stale from the shared build cache.
     d.appendVarFlag('do_pull_containers', 'vardeps',
                     ' ' + vardeps_str + ' ' + ' '.join(resolved_digest_vars))
+    if needs_always_pull:
+        # At least one moving tag could not be resolved to a digest at parse (no
+        # host skopeo, or the registry was unreachable, as on a cloud build whose
+        # registry auth is not available at parse). Pull fresh on every build by
+        # making the task always run. nostamp keeps the basehash deterministic,
+        # unlike a per-build value folded into vardeps, which BitBake rejects as
+        # non-deterministic metadata.
+        d.setVarFlag('do_pull_containers', 'nostamp', '1')
 
     if containers:
         bb.note("Configured %d containers from local.conf: %s" % (len(containers), ', '.join(containers)))
