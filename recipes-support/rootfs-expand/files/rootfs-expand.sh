@@ -38,22 +38,47 @@ fi
 
 log_info "Root partition: $ROOT_PART"
 
-# Extract device and partition number
-# Handle /dev/mmcblk0p2, /dev/sda2, /dev/nvme0n1p2 formats
-case "$ROOT_PART" in
-    /dev/mmcblk*p* | /dev/nvme*n*p*)
-        ROOT_DEV=$(echo "$ROOT_PART" | sed 's/p[0-9]*$//')
-        PART_NUM=$(echo "$ROOT_PART" | sed 's/.*p//')
-        ;;
-    /dev/sd* | /dev/vd*)
-        ROOT_DEV=$(echo "$ROOT_PART" | sed 's/[0-9]*$//')
-        PART_NUM=$(echo "$ROOT_PART" | sed 's/.*[a-z]//')
-        ;;
-    *)
-        log_error "Unsupported device format: $ROOT_PART"
-        exit 1
-        ;;
-esac
+# Map the path root was mounted from to its disk and partition number.
+#
+# findmnt reports whatever the initramfs mounted root from, which is not always
+# a device node. A board whose kernel command line says root=/dev/mmcblk0p2, as
+# a Raspberry Pi does, gives a real node and matches the patterns below
+# directly. A board whose command line says root=PARTLABEL=rootfs, as every
+# meta-qcom machine does, mounts root through /dev/disk/by-partlabel/rootfs
+# instead: the patterns then matched nothing, expansion failed on every boot
+# with "Unsupported device format", and the rootfs stayed at its built size on
+# a disk many times larger. On an Arduino UNO Q that was 0.42 GB of a 30 GB
+# partition. So resolve any symlink before matching.
+#
+# Echoes "<disk> <partition-number>", and returns 1 for a path this script does
+# not know how to grow. No logging in here: it is called from the test suite.
+root_device_and_partition() {
+    _part=$1
+
+    _canon=$(readlink -f "$_part" 2>/dev/null) || _canon=""
+    if [ -n "$_canon" ]; then
+        _part=$_canon
+    fi
+
+    case "$_part" in
+        /dev/mmcblk*p* | /dev/nvme*n*p*)
+            echo "$(echo "$_part" | sed 's/p[0-9]*$//') $(echo "$_part" | sed 's/.*p//')"
+            ;;
+        /dev/sd* | /dev/vd*)
+            echo "$(echo "$_part" | sed 's/[0-9]*$//') $(echo "$_part" | sed 's/.*[a-z]//')"
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+RESOLVED=$(root_device_and_partition "$ROOT_PART") || {
+    log_error "Unsupported device format: $ROOT_PART"
+    exit 1
+}
+ROOT_DEV=${RESOLVED% *}
+PART_NUM=${RESOLVED#* }
 
 log_info "Root device: $ROOT_DEV, partition number: $PART_NUM"
 
