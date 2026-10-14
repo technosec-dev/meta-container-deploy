@@ -103,17 +103,32 @@ if [ "$DEVICE_SIZE" -eq 0 ] 2>/dev/null; then
     exit 1
 fi
 
-THRESHOLD=$((DEVICE_SIZE * 9 / 10))
-if [ "$CURRENT_SIZE" -ge "$THRESHOLD" ] 2>/dev/null; then
-    log_info "Partition already at maximum size, no expansion needed"
-    mkdir -p "$(dirname "$MARKER_FILE")"
-    touch "$MARKER_FILE"
-    exit 0
-fi
+# Whether the partition itself still has room to grow, with a 10% margin.
+#
+# A false answer must NOT end the run, and treating it as "nothing to do" was a
+# bug. The filesystem inside a partition can be far smaller than the partition,
+# which is the normal state after flashing an image whose partition was grown by
+# the flashing tool rather than by this script: Qualcomm's firehose patch0.xml
+# grows the last partition to fill the disk at flash time, so the partition
+# arrives at full size with the built filesystem inside it. This used to log
+# "Partition already at maximum size, no expansion needed" and exit 0, leaving a
+# 404 MB filesystem inside a 30 GB partition on every boot. Only a board whose
+# partition starts small, such as a Raspberry Pi, ever reached the resize below.
+#
+# Echoes nothing; returns 0 when the partition should be grown.
+partition_needs_expansion() {
+    _cur=$1
+    _dev=$2
+    [ "$_dev" -gt 0 ] 2>/dev/null || return 1
+    [ "$_cur" -lt "$((_dev * 9 / 10))" ] 2>/dev/null
+}
 
-# Expand partition using growpart if available
+# Expand the partition only if it has room. Either way the filesystem resize
+# below still runs, because that is the part that was never happening.
 PARTITION_CHANGED=0
-if command -v growpart >/dev/null 2>&1; then
+if ! partition_needs_expansion "$CURRENT_SIZE" "$DEVICE_SIZE"; then
+    log_info "Partition already uses the disk, skipping partition expansion"
+elif command -v growpart >/dev/null 2>&1; then
     log_info "Expanding partition using growpart..."
     if growpart "$ROOT_DEV" "$PART_NUM"; then
         log_info "Partition expanded successfully"

@@ -98,3 +98,53 @@ class TestRefusals:
     def test_refuses(self, part):
         rc, _ = resolve(part)
         assert rc == 1, "accepted %r, which it cannot grow" % part
+
+
+def needs_expansion(current, device):
+    """Run partition_needs_expansion; returns True when it says grow."""
+    script = shell_func("partition_needs_expansion") + \
+        '\npartition_needs_expansion "$1" "$2"\n'
+    p = subprocess.run(["/bin/sh", "-c", script, "sh", str(current), str(device)],
+                       capture_output=True, text=True)
+    return p.returncode == 0
+
+
+class TestPartitionExpansionDecision:
+    """
+    Whether the PARTITION needs growing, which is not the same question as
+    whether the FILESYSTEM does.
+
+    The script used to answer "partition is already big" with exit 0 and a
+    marker file, so the filesystem resize never ran. Qualcomm's firehose
+    patch0.xml grows the last partition to fill the disk at flash time, so on
+    those boards the partition arrives full size with the built filesystem
+    inside it: a 404 MB filesystem in a 30 GB partition, on every boot, with
+    the service reporting success. A Raspberry Pi's partition starts small, so
+    it fell through to growpart and the resize happened as a side effect, which
+    is why this looked like it worked.
+    """
+
+    def test_a_small_partition_should_grow(self):
+        assert needs_expansion(400 * 1024**2, 30 * 1024**3) is True
+
+    # The real Arduino UNO Q numbers: a 30.07 GB rootfs partition on a 29.1 GiB
+    # eMMC, so 96% of the disk. The partition is done; the filesystem was not.
+    def test_the_uno_q_partition_should_not_grow(self):
+        assert needs_expansion(58743895 * 512, 31268536320) is False
+
+    def test_exactly_at_the_ten_percent_margin_does_not_grow(self):
+        device = 30 * 1024**3
+        assert needs_expansion(device * 9 // 10, device) is False
+
+    def test_just_under_the_margin_grows(self):
+        device = 30 * 1024**3
+        assert needs_expansion(device * 9 // 10 - 1, device) is True
+
+    # No division by zero, and no claiming a growable partition when the disk
+    # size could not be read.
+    def test_an_unknown_device_size_does_not_grow(self):
+        assert needs_expansion(400 * 1024**2, 0) is False
+
+    def test_a_partition_filling_the_disk_does_not_grow(self):
+        device = 30 * 1024**3
+        assert needs_expansion(device, device) is False
