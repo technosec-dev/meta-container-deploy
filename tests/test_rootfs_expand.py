@@ -148,3 +148,66 @@ class TestPartitionExpansionDecision:
     def test_a_partition_filling_the_disk_does_not_grow(self):
         device = 30 * 1024**3
         assert needs_expansion(device, device) is False
+
+
+def size_column(df_output):
+    """Run df_size_column with df_output on stdin; returns its stdout."""
+    script = shell_func("df_size_column") + "\ndf_size_column\n"
+    p = subprocess.run(["/bin/sh", "-c", script], input=df_output,
+                       capture_output=True, text=True)
+    assert p.returncode == 0, p.stderr
+    return p.stdout.strip()
+
+
+class TestReportedSize:
+    """
+    Which column of df the completion message reports.
+
+    The script said "New size: $(df -h / | tail -1 | awk '{print $2}')", which
+    assumes the device name shares a line with the figures. BusyBox puts a name
+    wider than its column on a line of its own, so on an Arduino UNO Q
+    (/dev/disk/by-partlabel/rootfs, 29 characters) field 2 of the last line was
+    Used, and a resize that had just grown the root filesystem from 373 MB to
+    26.6 GB logged "New size: 298.1M". The resize itself was correct; only the
+    evidence for it was wrong, which is the harder kind of bug to notice.
+    """
+
+    # Verbatim from the board, after the resize succeeded.
+    BUSYBOX_WRAPPED = (
+        "Filesystem                Size      Used Available Use% Mounted on\n"
+        "/dev/disk/by-partlabel/rootfs\n"
+        "                         26.6G    298.1M     25.1G   1% /\n"
+    )
+
+    # The same board before the resize, to prove the column is not found by
+    # looking for something that only a grown filesystem prints.
+    BUSYBOX_WRAPPED_SMALL = (
+        "Filesystem                Size      Used Available Use% Mounted on\n"
+        "/dev/disk/by-partlabel/rootfs\n"
+        "                        373.3M    298.1M     46.1M  87% /\n"
+    )
+
+    # A short device name, as a Raspberry Pi reports: name and figures on one
+    # line. This is the case that always worked and must keep working.
+    SINGLE_LINE = (
+        "Filesystem      Size  Used Avail Use% Mounted on\n"
+        "/dev/mmcblk0p2   29G  2.1G   26G   8% /\n"
+    )
+
+    def test_wrapped_name_reports_size_not_used(self):
+        assert size_column(self.BUSYBOX_WRAPPED) == "26.6G"
+
+    def test_wrapped_name_before_the_resize(self):
+        assert size_column(self.BUSYBOX_WRAPPED_SMALL) == "373.3M"
+
+    def test_single_line_still_reports_size(self):
+        assert size_column(self.SINGLE_LINE) == "29G"
+
+    # GNU coreutils df, which does not wrap, with a name long enough that the
+    # old field-2 read would have been Size by luck rather than by rule.
+    def test_gnu_df_long_name(self):
+        out = (
+            "Filesystem                    Size  Used Avail Use% Mounted on\n"
+            "/dev/disk/by-partlabel/rootfs   27G  299M   25G   2% /\n"
+        )
+        assert size_column(out) == "27G"

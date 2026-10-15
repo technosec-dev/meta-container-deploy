@@ -103,6 +103,24 @@ if [ "$DEVICE_SIZE" -eq 0 ] 2>/dev/null; then
     exit 1
 fi
 
+# The size column of a df report arriving on stdin.
+#
+# BusyBox df prints a device name wider than its column on a line of its own and
+# the figures on the next, so the last line of "df -h /" can read
+#
+#     26.6G    298.1M     25.1G   1% /
+#
+# with no device name in it at all. Field 2 is then Used, not Size, and this
+# reported a freshly grown 26.6 GB root filesystem as "New size: 298.1M" on an
+# Arduino UNO Q. Counting back from the end of the line picks the same column
+# whether the name wrapped or not, because the five figures after it always
+# follow.
+#
+# Echoes the size column. No logging in here: it is called from the test suite.
+df_size_column() {
+    tail -1 | awk '{ print $(NF - 4) }'
+}
+
 # Whether the partition itself still has room to grow, with a 10% margin.
 #
 # A false answer must NOT end the run, and treating it as "nothing to do" was a
@@ -230,7 +248,7 @@ mkdir -p "$(dirname "$MARKER_FILE")"
 touch "$MARKER_FILE"
 
 # Log final size
-NEW_SIZE=$(df -h / | tail -1 | awk '{print $2}')
+NEW_SIZE=$(df -h / | df_size_column)
 log_info "Root filesystem expansion complete. New size: $NEW_SIZE"
 
 exit 0
