@@ -492,7 +492,7 @@ IMPORT_EOF
     if [ -f "${WORKDIR}/container-digests.json" ]; then
         install -d ${D}${datadir}/containers
         install -m 0644 ${WORKDIR}/container-digests.json \
-            ${D}${datadir}/containers/
+            ${D}${datadir}/containers/container-digests-${CONTAINER_NAME}.json
     fi
 }
 
@@ -501,7 +501,7 @@ FILES:${PN}:append = " \
     ${CONTAINER_PRELOAD_DIR}/${CONTAINER_NAME} \
     ${CONTAINER_IMPORT_MARKER_DIR} \
     ${sysconfdir}/containers/import.d/${CONTAINER_NAME}.sh \
-    ${datadir}/containers/container-digests.json \
+    ${datadir}/containers/container-digests-${CONTAINER_NAME}.json \
 "
 
 # Ensure runtime dependencies
@@ -511,8 +511,8 @@ RDEPENDS:${PN} += "container-import"
 do_deploy() {
     if [ -f "${WORKDIR}/container-digests.json" ]; then
         install -d ${DEPLOYDIR}
-        install -m 0644 ${WORKDIR}/container-digests.json ${DEPLOYDIR}/
-        bbnote "Deployed container-digests.json to ${DEPLOYDIR}"
+        install -m 0644 ${WORKDIR}/container-digests.json ${DEPLOYDIR}/container-digests-${CONTAINER_NAME}.json
+        bbnote "Deployed container-digests-${CONTAINER_NAME}.json to ${DEPLOYDIR}"
     fi
 }
 addtask do_deploy after do_install before do_build
