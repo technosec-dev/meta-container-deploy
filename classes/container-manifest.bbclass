@@ -1399,7 +1399,12 @@ if [ -d "$IMAGE_DIR" ] && [ ! -f "$MARKER_FILE" ]; then
     fi
 
     if [ $? -eq 0 ]; then
+        # skopeo and podman do not sync the storage: write the image to
+        # disk before it is marked as imported, else a power cut can leave
+        # a marked but incomplete image that is never imported again
+        sync
         touch "$MARKER_FILE"
+        sync
         echo "Container image $CONTAINER_NAME imported successfully"
     else
         echo "Failed to import container image $CONTAINER_NAME" >&2
